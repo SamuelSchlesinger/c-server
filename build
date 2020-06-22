@@ -1,0 +1,7 @@
+#!/bin/bash
+gcc server.c \
+-o server \
+-Wall \
+-Werror \
+-lpthread \
+-D PROCESSOR_COUNT=$(grep -c ^processor /proc/cpuinfo)

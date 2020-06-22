@@ -43,10 +43,8 @@ struct client {
   // address the client connected from
 };
 
-// a locked buffer/client pair
+// a buffer/client pair
 struct client_buffer {  
-  // a lock that anyone who uses this must take
-  sem_t lock; 
   // a buffer containing all of the we've read from a client
   char* buffer;
   // the size of the allocated buffer
@@ -57,71 +55,52 @@ struct client_buffer {
   struct client client;
 };
 
-struct client_buffer* make_client_buffer
+struct client_buffer_reference {
+  // client buffer
+  struct client_buffer* client_buffer;
+  // lock
+  sem_t* lock;
+};
+
+struct client_buffer_reference make_client_buffer
   ( // the client to read from
     struct client client
     // the initial size of the buffer
   , int initial_size
   ) 
 {
+  struct client_buffer_reference client_buffer_reference;
   if (initial_size < 0)
     panic("initial_size of client_buffer less than 0")
-  struct client_buffer* client_buffer = (struct client_buffer*) malloc(sizeof(struct client_buffer));
-  client_buffer->buffer = (char *) malloc(sizeof(char) * initial_size);
-  client_buffer->size = initial_size;
-  client_buffer->bytes_read = 0;
-  client_buffer->client = client;
-  if (sem_init
-        ( // the location of the lock
-          &client_buffer->lock,
-          // this lock is shared with all threads 
-          0,
-          // value of the lock
-          1) == -1)
-    panic("failed to initialize client_buffer semaphore")
-  return client_buffer;
+  client_buffer_reference.client_buffer =
+    (struct client_buffer*) malloc(sizeof(struct client_buffer));
+  client_buffer_reference.client_buffer->buffer = (char *) malloc(sizeof(char) * initial_size);
+  client_buffer_reference.client_buffer->size = initial_size;
+  client_buffer_reference.client_buffer->bytes_read = 0;
+  client_buffer_reference.client_buffer->client = client;
+  sem_t* lock = (sem_t*) malloc(sizeof(sem_t));
+  sem_init(lock, 0, 1);
+  client_buffer_reference.lock = lock;
+  return client_buffer_reference;
 }
 
-// caller must completely own this buffer, as its contents may be ripped out
-int read_available(struct client_buffer *client_buffer) {
+// caller must completely own this buffer, and have locked it
+int read_available(struct client_buffer_reference client_buffer_reference) {
   int available;
   // how many bytes are available on the socket?
-  ioctl(client_buffer->client.socket, FIONREAD, &available);
+  ioctl(client_buffer_reference.client_buffer->client.socket, FIONREAD, &available);
   if (available > 0) {
     // make sure we have enough room
-    if (client_buffer->size - client_buffer->bytes_read > available) {
+    if (client_buffer_reference.client_buffer->size - client_buffer_reference.client_buffer->bytes_read > available) {
       // resize buffer if necessary
-      client_buffer->buffer = realloc(client_buffer->buffer, sizeof(char) * client_buffer->bytes_read + available + client_buffer->size);
+      client_buffer_reference.client_buffer->buffer = realloc(client_buffer_reference.client_buffer->buffer, 2 * client_buffer_reference.client_buffer->size);
     }
-    int length = read(client_buffer->client.socket, client_buffer->buffer + client_buffer->bytes_read, available);
+    int length = read(client_buffer_reference.client_buffer->client.socket, client_buffer_reference.client_buffer->buffer + client_buffer_reference.client_buffer->bytes_read, available);
     if (length != available)
       panic("reading available bytes")
     return available;
   }
   return 0;
-}
-
-// safely slices the client_buffer, checking for thread safety
-void slice_client_buffer
-  ( 
-    // the client_buffer we want a slice of
-    struct client_buffer* client_buffer,
-    // the leftmost index of the slice (unchecked)
-    int l,
-    // the rightmost index of the slice (unchecked)
-    int r,
-    // the location we are copying to
-    char* to
-  )
-{
-  sem_wait(&client_buffer->lock);
-
-  int i;
-  for (i = l; i <= r; i++) {
-    to[i] = client_buffer->buffer[i];
-  }
-
-  sem_post(&client_buffer->lock);
 }
 
 // a configuration for the server
@@ -193,9 +172,16 @@ struct server initialize_server
 }
 
 // running a server
-void run_server(void (*handle_client)(struct client_buffer* client_buffer), struct server server) {
+void run_server
+  ( // client_buffer_reference consumer
+    void (*handle_client)(struct client_buffer_reference client_buffer_reference),
+    // server handle
+    struct server server
+  )
+{
   // loop, waiting for connections and adding them to the queue
   while (true) {
+
     struct client client;
     socklen_t client_address_size = (socklen_t) sizeof(struct sockaddr_in);
 
@@ -209,15 +195,16 @@ void run_server(void (*handle_client)(struct client_buffer* client_buffer), stru
 }
 
 // handling an individual client
-void handle_client(struct client_buffer* client_buffer) {
-  sem_wait(&client_buffer->lock);
+void handle_client(struct client_buffer_reference client_buffer_reference)
+{
+  sem_wait(client_buffer_reference.lock);
   int read = 0;
   while (read == 0) {
-    read = read_available(client_buffer);
-    printf(".");
+    read += read_available(client_buffer_reference);
+    printf("\nReceived %d bytes\n", read);
   }
-  printf("\nReceived %d bytes\n", read);
-  sem_post(&client_buffer->lock);
+  fflush(stdout);
+  sem_post(client_buffer_reference.lock);
 }
 
 int main() {

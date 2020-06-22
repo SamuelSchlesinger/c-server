@@ -62,40 +62,36 @@ struct client_buffer_reference {
   sem_t* lock;
 };
 
-struct client_buffer_reference make_client_buffer
+struct client_buffer* make_client_buffer
   ( // the client to read from
     struct client client
     // the initial size of the buffer
   , int initial_size
   ) 
 {
-  struct client_buffer_reference client_buffer_reference;
   if (initial_size < 0)
     panic("initial_size of client_buffer less than 0")
-  client_buffer_reference.client_buffer =
+  struct client_buffer* client_buffer =
     (struct client_buffer*) malloc(sizeof(struct client_buffer));
-  client_buffer_reference.client_buffer->buffer = (char *) malloc(sizeof(char) * initial_size);
-  client_buffer_reference.client_buffer->size = initial_size;
-  client_buffer_reference.client_buffer->bytes_read = 0;
-  client_buffer_reference.client_buffer->client = client;
-  sem_t* lock = (sem_t*) malloc(sizeof(sem_t));
-  sem_init(lock, 0, 1);
-  client_buffer_reference.lock = lock;
-  return client_buffer_reference;
+  client_buffer->buffer = (char *) malloc(sizeof(char) * initial_size);
+  client_buffer->size = initial_size;
+  client_buffer->bytes_read = 0;
+  client_buffer->client = client;
+  return client_buffer;
 }
 
 // caller must completely own this buffer, and have locked it
-int read_available(struct client_buffer_reference client_buffer_reference) {
+int read_available(struct client_buffer* client_buffer) {
   int available;
   // how many bytes are available on the socket?
-  ioctl(client_buffer_reference.client_buffer->client.socket, FIONREAD, &available);
+  ioctl(client_buffer->client.socket, FIONREAD, &available);
   if (available > 0) {
     // make sure we have enough room
-    if (client_buffer_reference.client_buffer->size - client_buffer_reference.client_buffer->bytes_read > available) {
+    if (client_buffer->size - client_buffer->bytes_read > available) {
       // resize buffer if necessary
-      client_buffer_reference.client_buffer->buffer = realloc(client_buffer_reference.client_buffer->buffer, 2 * client_buffer_reference.client_buffer->size);
+      client_buffer->buffer = realloc(client_buffer->buffer, 2 * client_buffer->size);
     }
-    int length = read(client_buffer_reference.client_buffer->client.socket, client_buffer_reference.client_buffer->buffer + client_buffer_reference.client_buffer->bytes_read, available);
+    int length = read(client_buffer->client.socket, client_buffer->buffer + client_buffer->bytes_read, available);
     if (length != available)
       panic("reading available bytes")
     return available;
@@ -145,6 +141,8 @@ struct server {
   int socket;
   // the configuration of the server
   struct config config;
+  // the array of config.nrequests client_buffer_references
+  struct client_buffer_reference* client_buffer_references;
 };
 
 // make a new server
@@ -168,6 +166,9 @@ struct server initialize_server
   if (listen(server.socket, config.connection_backlog) == -1)
     panic("failed to listen on socket")
 
+  server.client_buffer_references =
+    (struct client_buffer_reference*) malloc(sizeof(struct client_buffer_reference) * config.nrequests);
+
   return server;
 }
 
@@ -179,18 +180,24 @@ void run_server
     struct server server
   )
 {
-  // loop, waiting for connections and adding them to the queue
+  // loop, forever for connections and adding them to the queue
   while (true) {
+    int i;
+    for (i = 0; i < server.config.nrequests; i++) {
+      if ( sem_trywait(server.client_buffer_references[i].lock) == 0 ) {
+        socklen_t client_address_size = (socklen_t) sizeof(struct sockaddr_in);
+        struct client client;
 
-    struct client client;
-    socklen_t client_address_size = (socklen_t) sizeof(struct sockaddr_in);
-
-    // accept a peer connection
-    if ((client.socket = accept(server.socket, (struct sockaddr *) &client.address, &client_address_size)) == -1)
-      panic("failed to accept connection")
-    
-    // handle the client requests
-    handle_client(make_client_buffer(client, 1024));
+        // accept a peer connection
+        if ((client.socket = accept(server.socket, (struct sockaddr *) &client.address, &client_address_size)) == -1)
+          panic("failed to accept connection")
+        // handle the client requests
+        server.client_buffer_references[i].client_buffer = make_client_buffer(client, 1024);
+        sem_post(server.client_buffer_references[i].lock);
+      } else {
+        continue;
+      }
+    }
   }
 }
 
@@ -200,7 +207,7 @@ void handle_client(struct client_buffer_reference client_buffer_reference)
   sem_wait(client_buffer_reference.lock);
   int read = 0;
   while (read == 0) {
-    read += read_available(client_buffer_reference);
+    read += read_available(client_buffer_reference.client_buffer);
     printf("\nReceived %d bytes\n", read);
   }
   fflush(stdout);
